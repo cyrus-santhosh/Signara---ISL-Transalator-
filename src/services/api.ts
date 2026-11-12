@@ -1,3 +1,5 @@
+import type { KeypointFrame } from "./signSocket";
+
 export type Message = {
   id: string;
   role: "user" | "assistant";
@@ -66,6 +68,18 @@ export const mockConversations: Conversation[] = [
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
+export type DatasetLabel = "hello_how_are_you" | "i_need_help" | "no_sign";
+export type DatasetCounts = Record<DatasetLabel, number>;
+
+export type RecognitionModelStatus = {
+  model_loaded: boolean;
+  model_path: string;
+  model_type: string;
+  load_error: string | null;
+  probability_threshold: number;
+  probability_note: string;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -78,6 +92,41 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(body?.detail ?? `Request failed with status ${response.status}.`);
   }
   return (await response.json()) as T;
+}
+
+export async function saveDatasetRecording(recording: {
+  recordingId: string;
+  label: DatasetLabel;
+  timestamp: number;
+  sequence: KeypointFrame[];
+}) {
+  return request<{ filename: string; counts: DatasetCounts }>("/api/dataset/recording", {
+    method: "POST",
+    body: JSON.stringify({
+      recording_id: recording.recordingId,
+      label: recording.label,
+      timestamp: recording.timestamp,
+      frame_count: recording.sequence.length,
+      sequence: recording.sequence,
+    }),
+  });
+}
+
+export async function getDatasetCounts() {
+  return request<DatasetCounts>("/api/dataset/counts");
+}
+
+export async function getRecognitionModelStatus() {
+  return request<RecognitionModelStatus>("/api/recognition/model-status");
+}
+
+export async function exportDataset() {
+  const response = await fetch(`${apiBaseUrl}/api/dataset/export.zip`);
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(body?.detail ?? `Dataset export failed with status ${response.status}.`);
+  }
+  return response.blob();
 }
 
 export async function postChat(glosses: string[], targetLanguage: string) {
@@ -99,6 +148,55 @@ export async function postChat(glosses: string[], targetLanguage: string) {
       target_lang: languageCodes[targetLanguage] ?? targetLanguage,
     }),
   });
+}
+
+export type ConversationResult = {
+  original_text: string;
+  translated_text: string;
+  assistant_reply: string;
+  target_language: "en" | "hi" | "kn";
+  audio_url: string | null;
+  audio_error: string | null;
+};
+
+export async function getConversationStatus() {
+  return request<{ gemini_configured: boolean; model: string }>("/api/conversation/status");
+}
+
+export async function postConversation(input: {
+  originalText: string;
+  targetLanguage: "en" | "hi" | "kn";
+  eventId: string;
+  context: Array<{ role: "user" | "assistant"; text: string }>;
+  generateAudio: boolean;
+  recognitionLabel?: string;
+}) {
+  const result = await request<Omit<ConversationResult, "audio_url"> & { audio_url: string | null }>(
+    "/api/conversation",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        original_text: input.originalText,
+        target_language: input.targetLanguage,
+        event_id: input.eventId,
+        context: input.context,
+        generate_audio: input.generateAudio,
+        recognition_label: input.recognitionLabel,
+      }),
+    },
+  );
+  return {
+    ...result,
+    audio_url: result.audio_url ? `${apiBaseUrl}${result.audio_url}` : null,
+  };
+}
+
+export async function requestSpeech(text: string, targetLanguage: "en" | "hi" | "kn") {
+  const result = await request<{ audio_url: string }>("/api/speech", {
+    method: "POST",
+    body: JSON.stringify({ text, target_language: targetLanguage }),
+  });
+  return `${apiBaseUrl}${result.audio_url}`;
 }
 
 export async function getConversations() {

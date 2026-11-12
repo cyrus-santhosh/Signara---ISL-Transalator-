@@ -3,6 +3,9 @@ dist/
 build/
 .cache/
 backend/data/
+backend/models/
+__pycache__/
+*.py[cod]
 .env*
 !.env.example
 .vite/
