@@ -109,7 +109,7 @@ def run_conversation(
         raise ValueError("original_text must be a non-empty string.")
     if len(original_text) > 500:
         raise ValueError("original_text must be at most 500 characters.")
-    if target_language not in LANGUAGES:
+    if not isinstance(target_language, str) or target_language not in LANGUAGES:
         raise ValueError("target_language must be one of: en, hi, kn.")
 
     safe_context = []

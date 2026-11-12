@@ -23,7 +23,12 @@ from . import auth, db
 from .graph import PipelineError, gemini_is_configured, run_conversation, run_pipeline
 from .model_service import LiveRecognitionSession, recognition_model
 from .recognizer import validate_keypoint_message
-from .tts import SpeechGenerationError, audio_directory, generate_speech
+from .tts import (
+    SpeechGenerationError,
+    audio_directory,
+    cleanup_expired_audio_files,
+    generate_speech,
+)
 
 logger = logging.getLogger(__name__)
 _conversation_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
@@ -56,6 +61,7 @@ def _cors_origins() -> list[str]:
 async def lifespan(_: FastAPI):
     db.initialize_database()
     audio_directory()
+    cleanup_expired_audio_files()
     recognition_model.load()
     if gemini_is_configured():
         logger.info("Gemini API key is configured.")
@@ -327,7 +333,7 @@ async def _cached_conversation(
 def conversation_status() -> dict[str, Any]:
     return {
         "gemini_configured": gemini_is_configured(),
-        "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        "model": os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
     }
 
 
@@ -341,7 +347,14 @@ async def conversation(request: Request) -> dict[str, Any]:
     context = payload.get("context", [])
     generate_audio_value = payload.get("generate_audio", False)
 
-    if recognition_label == "no_sign":
+    if recognition_label is not None and recognition_label not in DATASET_LABELS:
+        raise HTTPException(status_code=400, detail="recognition_label is not a supported phrase class.")
+    normalized_text = (
+        original_text.strip().lower().replace(" ", "_").replace("-", "_")
+        if isinstance(original_text, str)
+        else ""
+    )
+    if recognition_label == "no_sign" or normalized_text == "no_sign":
         raise HTTPException(status_code=422, detail="A no_sign recognition cannot start a conversation.")
     if (
         not isinstance(original_text, str)
@@ -349,7 +362,7 @@ async def conversation(request: Request) -> dict[str, Any]:
         or len(original_text) > 500
     ):
         raise HTTPException(status_code=400, detail="original_text must be a non-empty string of at most 500 characters.")
-    if target_language not in CONVERSATION_LANGUAGES:
+    if not isinstance(target_language, str) or target_language not in CONVERSATION_LANGUAGES:
         raise HTTPException(status_code=400, detail="target_language must be one of: en, hi, kn.")
     if not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 100:
         raise HTTPException(status_code=400, detail="event_id must be a non-empty string of at most 100 characters.")
@@ -359,6 +372,7 @@ async def conversation(request: Request) -> dict[str, Any]:
         not isinstance(item, dict)
         or item.get("role") not in ("user", "assistant")
         or not isinstance(item.get("text"), str)
+        or len(item.get("text", "")) > 500
         for item in context
     ):
         raise HTTPException(status_code=400, detail="Each context message needs a valid role and text.")
@@ -403,7 +417,7 @@ async def speech(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="text must be a non-empty string.")
     if len(text) > 1000:
         raise HTTPException(status_code=400, detail="text must be at most 1000 characters.")
-    if target_language not in CONVERSATION_LANGUAGES:
+    if not isinstance(target_language, str) or target_language not in CONVERSATION_LANGUAGES:
         raise HTTPException(status_code=400, detail="target_language must be one of: en, hi, kn.")
     try:
         audio_path = await run_in_threadpool(generate_speech, text.strip(), target_language)

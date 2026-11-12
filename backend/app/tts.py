@@ -1,4 +1,6 @@
+import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -7,7 +9,9 @@ from gtts import gTTS
 from gtts.tts import gTTSError
 
 
+logger = logging.getLogger(__name__)
 BACKEND_DIR = Path(__file__).resolve().parents[1]
+AUDIO_RETENTION_SECONDS = 24 * 60 * 60
 SUPPORTED_LANGUAGES = {
     "hi": "hi",
     "hindi": "hi",
@@ -31,6 +35,19 @@ def audio_directory() -> Path:
         path = BACKEND_DIR / path
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def cleanup_expired_audio_files() -> None:
+    directory = audio_directory().resolve()
+    cutoff = time.time() - AUDIO_RETENTION_SECONDS
+    for path in directory.iterdir():
+        try:
+            if path.suffix.lower() != ".mp3" or path.is_symlink() or not path.is_file():
+                continue
+            if path.stat().st_mtime < cutoff and path.resolve().parent == directory:
+                path.unlink()
+        except OSError as exc:
+            logger.warning("Could not clean up expired audio file %s: %s", path.name, exc)
 
 
 def generate_speech(text: str, target_lang: str = "hi") -> str:
