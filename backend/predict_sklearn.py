@@ -33,10 +33,22 @@ def main() -> None:
     class_to_idx = bundle.get("class_to_idx")
     config = bundle.get("preprocessing")
     model = bundle.get("model")
-    if not isinstance(class_to_idx, dict) or set(class_to_idx) != set(LABELS):
+    if (
+        not isinstance(class_to_idx, dict)
+        or not class_to_idx
+        or any(label not in LABELS for label in class_to_idx)
+        or any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in class_to_idx.values()
+        )
+        or set(class_to_idx.values()) != set(range(len(class_to_idx)))
+    ):
         raise SystemExit("Checkpoint class mapping is missing or incompatible.")
     if not isinstance(config, dict) or model is None:
         raise SystemExit("Checkpoint is missing model or preprocessing metadata.")
+    classifier_classes = set(str(label) for label in model.named_steps["classifier"].classes_)
+    if classifier_classes != set(class_to_idx):
+        raise SystemExit("Checkpoint output classes do not match its saved class mapping.")
     features = extract_temporal_features(
         recording,
         config["landmark_means"],

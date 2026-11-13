@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 from . import auth, db
-from .graph import PipelineError, gemini_is_configured, run_conversation, run_pipeline
+from .graph import PipelineError, groq_is_configured, run_pipeline, run_translation
 from .model_service import LiveRecognitionSession, recognition_model
 from .recognizer import validate_keypoint_message
 from .tts import (
@@ -31,13 +31,14 @@ from .tts import (
 )
 
 logger = logging.getLogger(__name__)
-_conversation_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-_conversation_tasks_lock = asyncio.Lock()
-CONVERSATION_LANGUAGES = {"en", "hi", "kn"}
+_translation_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+_translation_tasks_lock = asyncio.Lock()
+TARGET_LANGUAGES = {"en", "hi", "kn"}
 
 DATASET_LABELS = {
     "hello_how_are_you",
     "i_need_help",
+    "i_need_to_meet_the_doctor",
     "no_sign",
 }
 MAX_RECORDING_FRAMES = 60
@@ -63,11 +64,11 @@ async def lifespan(_: FastAPI):
     audio_directory()
     cleanup_expired_audio_files()
     recognition_model.load()
-    if gemini_is_configured():
-        logger.info("Gemini API key is configured.")
+    if groq_is_configured():
+        logger.info("Groq API key is configured.")
     else:
         logger.warning(
-            "Gemini API key is missing. Conversation requests will return a configuration error."
+            "Groq API key is missing. Conversation requests will return a configuration error."
         )
     yield
 
@@ -137,7 +138,10 @@ async def save_dataset_recording(request: Request) -> dict[str, Any]:
     if not isinstance(label, str) or label not in DATASET_LABELS:
         raise HTTPException(
             status_code=400,
-            detail="label must be hello_how_are_you, i_need_help, or no_sign.",
+            detail=(
+                "label must be hello_how_are_you, i_need_help, "
+                "i_need_to_meet_the_doctor, or no_sign."
+            ),
         )
 
     recording_id_value = payload.get("recording_id")
@@ -202,9 +206,10 @@ async def save_dataset_recording(request: Request) -> dict[str, Any]:
         )
 
     directory = _dataset_directory() / label
+    destination = directory / f"{recording_id}.json"
+    created_destination = False
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        destination = directory / f"{recording_id}.json"
         recording = {
             "label": label,
             "timestamp": timestamp,
@@ -212,6 +217,7 @@ async def save_dataset_recording(request: Request) -> dict[str, Any]:
             "sequence": validated_sequence,
         }
         with destination.open("x", encoding="utf-8") as output:
+            created_destination = True
             json.dump(recording, output, separators=(",", ":"), allow_nan=False)
     except FileExistsError:
         try:
@@ -227,10 +233,20 @@ async def save_dataset_recording(request: Request) -> dict[str, Any]:
                 status_code=409,
                 detail="This recording ID was already used for a different sample.",
             )
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
+        if created_destination:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove incomplete dataset recording %s", destination)
         raise HTTPException(status_code=500, detail="Could not save the dataset recording.") from exc
 
-    return {"filename": destination.name, "counts": _dataset_counts()}
+    return {
+        "saved": True,
+        "label": label,
+        "filename": destination.name,
+        "counts": _dataset_counts(),
+    }
 
 
 @app.get("/api/dataset/export.zip")
@@ -258,7 +274,7 @@ def export_dataset() -> FileResponse:
 
 
 @app.post("/api/chat")
-async def chat(request: Request) -> dict[str, str]:
+async def chat(request: Request) -> dict[str, Any]:
     payload = await _json_object(request)
     glosses = payload.get("glosses")
     if not isinstance(glosses, list):
@@ -280,71 +296,80 @@ async def chat(request: Request) -> dict[str, str]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PipelineError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.error_code, "message": str(exc)},
+        ) from exc
     except SpeechGenerationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    audio_path = result.get("audio_path")
+    audio_file = Path(audio_path) if audio_path else None
+    audio_url = (
+        f"/api/audio/{audio_file.name}"
+        if audio_file and audio_file.is_file() and audio_file.stat().st_size > 0
+        else None
+    )
     return {
-        "sentence": result["sentence"],
-        "replyText": result["translated_reply"],
-        "replyOriginal": result["reply"],
-        "audioUrl": f"/api/audio/{Path(result['audio_path']).name}",
+        "original_text": " ".join(gloss.strip() for gloss in glosses),
+        "translated_text": result["translated_text"],
+        "target_language": target_lang,
+        "audio_url": audio_url,
+        "audio_error": result["audio_error"],
     }
 
 
-async def _cached_conversation(
+async def _cached_translation(
     event_id: str,
     original_text: str,
     target_language: str,
-    context: list[dict[str, str]],
     generate_audio: bool,
 ) -> dict[str, Any]:
-    async with _conversation_tasks_lock:
-        task = _conversation_tasks.get(event_id)
+    async with _translation_tasks_lock:
+        task = _translation_tasks.get(event_id)
         if task is None:
             task = asyncio.create_task(
                 run_in_threadpool(
-                    run_conversation,
+                    run_translation,
                     original_text,
                     target_language,
-                    context,
                     generate_audio,
                 )
             )
-            _conversation_tasks[event_id] = task
+            _translation_tasks[event_id] = task
     try:
         result = await asyncio.shield(task)
     except Exception:
-        async with _conversation_tasks_lock:
-            if _conversation_tasks.get(event_id) is task:
-                _conversation_tasks.pop(event_id, None)
+        async with _translation_tasks_lock:
+            if _translation_tasks.get(event_id) is task:
+                _translation_tasks.pop(event_id, None)
         raise
 
-    async with _conversation_tasks_lock:
-        while len(_conversation_tasks) > 256:
-            oldest_id, oldest_task = next(iter(_conversation_tasks.items()))
+    async with _translation_tasks_lock:
+        while len(_translation_tasks) > 256:
+            oldest_id, oldest_task = next(iter(_translation_tasks.items()))
             if not oldest_task.done():
                 break
-            _conversation_tasks.pop(oldest_id, None)
+            _translation_tasks.pop(oldest_id, None)
     return result
 
 
 @app.get("/api/conversation/status")
 def conversation_status() -> dict[str, Any]:
     return {
-        "gemini_configured": gemini_is_configured(),
-        "model": os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
+        "groq_configured": groq_is_configured(),
+        "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+        "mode": "translation_only",
     }
 
 
 @app.post("/api/conversation")
-async def conversation(request: Request) -> dict[str, Any]:
+async def translate_recognition(request: Request) -> dict[str, Any]:
     payload = await _json_object(request)
     original_text = payload.get("original_text")
     target_language = payload.get("target_language", "en")
     event_id = payload.get("event_id")
     recognition_label = payload.get("recognition_label")
-    context = payload.get("context", [])
     generate_audio_value = payload.get("generate_audio", False)
 
     if recognition_label is not None and recognition_label not in DATASET_LABELS:
@@ -355,42 +380,34 @@ async def conversation(request: Request) -> dict[str, Any]:
         else ""
     )
     if recognition_label == "no_sign" or normalized_text == "no_sign":
-        raise HTTPException(status_code=422, detail="A no_sign recognition cannot start a conversation.")
+        raise HTTPException(status_code=422, detail="A no_sign recognition cannot be translated.")
     if (
         not isinstance(original_text, str)
         or not original_text.strip()
         or len(original_text) > 500
     ):
         raise HTTPException(status_code=400, detail="original_text must be a non-empty string of at most 500 characters.")
-    if not isinstance(target_language, str) or target_language not in CONVERSATION_LANGUAGES:
+    if not isinstance(target_language, str) or target_language not in TARGET_LANGUAGES:
         raise HTTPException(status_code=400, detail="target_language must be one of: en, hi, kn.")
     if not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 100:
         raise HTTPException(status_code=400, detail="event_id must be a non-empty string of at most 100 characters.")
-    if not isinstance(context, list) or len(context) > 8:
-        raise HTTPException(status_code=400, detail="context must be a list of at most 8 messages.")
-    if any(
-        not isinstance(item, dict)
-        or item.get("role") not in ("user", "assistant")
-        or not isinstance(item.get("text"), str)
-        or len(item.get("text", "")) > 500
-        for item in context
-    ):
-        raise HTTPException(status_code=400, detail="Each context message needs a valid role and text.")
     if not isinstance(generate_audio_value, bool):
         raise HTTPException(status_code=400, detail="generate_audio must be a boolean.")
 
     try:
-        result = await _cached_conversation(
+        result = await _cached_translation(
             event_id.strip(),
             original_text.strip(),
             target_language,
-            context,
             generate_audio_value,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PipelineError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.error_code, "message": str(exc)},
+        ) from exc
 
     audio_path = result.get("audio_path")
     audio_url = None
@@ -401,7 +418,6 @@ async def conversation(request: Request) -> dict[str, Any]:
     return {
         "original_text": result["original_text"],
         "translated_text": result["translated_text"],
-        "assistant_reply": result["assistant_reply"],
         "target_language": result["target_language"],
         "audio_url": audio_url,
         "audio_error": result["audio_error"],
@@ -417,7 +433,7 @@ async def speech(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="text must be a non-empty string.")
     if len(text) > 1000:
         raise HTTPException(status_code=400, detail="text must be at most 1000 characters.")
-    if not isinstance(target_language, str) or target_language not in CONVERSATION_LANGUAGES:
+    if not isinstance(target_language, str) or target_language not in TARGET_LANGUAGES:
         raise HTTPException(status_code=400, detail="target_language must be one of: en, hi, kn.")
     try:
         audio_path = await run_in_threadpool(generate_speech, text.strip(), target_language)

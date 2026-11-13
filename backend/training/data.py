@@ -1,11 +1,19 @@
 import json
+import hashlib
+import itertools
 import math
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-LABELS = ("hello_how_are_you", "i_need_help", "no_sign")
+LABELS = (
+    "hello_how_are_you",
+    "i_need_help",
+    "i_need_to_meet_the_doctor",
+    "no_sign",
+)
 LANDMARK_GROUPS = (("leftHand", 21), ("rightHand", 21), ("pose", 33))
 CHANNELS_PER_LANDMARK = 6
 INPUT_SIZE = 75 * CHANNELS_PER_LANDMARK
@@ -25,6 +33,8 @@ class Recording:
     label: str | None
     features: list[list[float]]
     valid_channels: list[list[bool]]
+    timestamp: int | None = None
+    session_id: str | None = None
 
 
 def _finite_number(value: Any, description: str) -> float:
@@ -123,11 +133,24 @@ def load_recording(path: Path, expected_label: str | None = None) -> Recording:
     if label is not None and label not in LABELS:
         raise ValueError(f"Unsupported recording label {label!r}.")
 
+    timestamp = payload.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:
+        raise ValueError("Recording timestamp must be a positive integer.")
+    session_id = payload.get("session_id")
+    if session_id is not None and (
+        not isinstance(session_id, str) or not session_id.strip()
+    ):
+        raise ValueError("session_id must be a non-empty string when present.")
+
     sequence = payload.get("sequence")
     if not isinstance(sequence, list) or not sequence:
         raise ValueError("Recording sequence must be a non-empty list.")
     frame_count = payload.get("frame_count")
-    if frame_count is not None and frame_count != len(sequence):
+    if (
+        isinstance(frame_count, bool)
+        or not isinstance(frame_count, int)
+        or frame_count != len(sequence)
+    ):
         raise ValueError("Stored frame_count does not match sequence length.")
 
     features: list[list[float]] = []
@@ -145,23 +168,204 @@ def load_recording(path: Path, expected_label: str | None = None) -> Recording:
         features.append(row)
         valid_channels.append(row_valid)
 
-    return Recording(path, label, features, valid_channels)
+    return Recording(path, label, features, valid_channels, timestamp, session_id)
 
 
 def load_dataset(data_dir: Path = DEFAULT_DATA_DIR) -> tuple[list[Recording], list[str]]:
     recordings: list[Recording] = []
     errors: list[str] = []
+    if not data_dir.is_dir():
+        return [], [f"{data_dir}: dataset directory is missing."]
+
+    discovered_labels = {path.name for path in data_dir.iterdir() if path.is_dir()}
+    for label in sorted(discovered_labels - set(LABELS)):
+        errors.append(f"{data_dir / label}: unsupported class directory.")
     for label in LABELS:
         label_dir = data_dir / label
         if not label_dir.is_dir():
             errors.append(f"{label_dir}: directory is missing.")
             continue
-        for path in sorted(label_dir.glob("*.json")):
+        paths = sorted(label_dir.glob("*.json"))
+        if not paths:
+            errors.append(f"{label_dir}: no JSON recordings were found.")
+        for path in paths:
             try:
-                recordings.append(load_recording(path, expected_label=label))
+                recording = load_recording(path, expected_label=label)
+                recordings.append(recording)
             except ValueError as exc:
                 errors.append(f"{path}: {exc}")
-    return recordings, errors
+
+    hashes: dict[str, Path] = {}
+    unique_recordings: list[Recording] = []
+    for recording in recordings:
+        try:
+            content_hash = hashlib.sha256(recording.path.read_bytes()).hexdigest()
+        except OSError as exc:
+            errors.append(f"{recording.path}: could not hash recording: {exc}")
+            continue
+        previous_path = hashes.get(content_hash)
+        if previous_path is not None:
+            errors.append(
+                f"{recording.path}: exact duplicate of canonical recording {previous_path}."
+            )
+            continue
+        hashes[content_hash] = recording.path
+        unique_recordings.append(recording)
+    return unique_recordings, errors
+
+
+def recording_group_ids(
+    recordings: list[Recording], timestamp_gap_ms: int = 60_000
+) -> list[str]:
+    if timestamp_gap_ms < 0:
+        raise ValueError("timestamp_gap_ms must not be negative.")
+
+    group_ids: list[str | None] = [None] * len(recordings)
+    legacy_indices: list[int] = []
+    explicit_groups: dict[str, str] = {}
+    for index, recording in enumerate(recordings):
+        if recording.session_id:
+            group_ids[index] = explicit_groups.setdefault(
+                recording.session_id, f"session:{recording.session_id}"
+            )
+        else:
+            legacy_indices.append(index)
+
+    ordered_legacy = sorted(
+        legacy_indices,
+        key=lambda index: (
+            recordings[index].timestamp
+            if recordings[index].timestamp is not None
+            else 0,
+            str(recordings[index].path),
+        ),
+    )
+    burst = -1
+    previous_timestamp: int | None = None
+    for index in ordered_legacy:
+        timestamp = recordings[index].timestamp
+        if timestamp is None:
+            raise ValueError(f"{recordings[index].path}: missing timestamp for grouping.")
+        if (
+            previous_timestamp is None
+            or timestamp - previous_timestamp > timestamp_gap_ms
+        ):
+            burst += 1
+        group_ids[index] = f"legacy-burst:{burst:04d}"
+        previous_timestamp = timestamp
+    return [group_id or "" for group_id in group_ids]
+
+
+def grouped_train_validation_test_split(
+    recordings: list[Recording],
+    seed: int = 42,
+    timestamp_gap_ms: int = 60_000,
+) -> tuple[list[Recording], list[Recording], list[Recording], dict[str, list[str]]]:
+    if not recordings:
+        raise ValueError("Cannot split an empty recording dataset.")
+    group_ids = recording_group_ids(recordings, timestamp_gap_ms)
+    group_indices: dict[str, list[int]] = {}
+    for index, group_id in enumerate(group_ids):
+        group_indices.setdefault(group_id, []).append(index)
+    group_names = sorted(group_indices)
+    if len(group_names) < 3:
+        raise ValueError(
+            "At least three independent capture groups are needed for train, validation, and test."
+        )
+
+    label_group_support = {
+        label: {
+            group_name
+            for group_name, indices in group_indices.items()
+            if any(recordings[index].label == label for index in indices)
+        }
+        for label in LABELS
+    }
+    labels_requiring_all_splits = {
+        label for label, groups in label_group_support.items() if len(groups) >= 3
+    }
+    counts_by_group = {
+        group_name: {
+            label: sum(recordings[index].label == label for index in indices)
+            for label in LABELS
+        }
+        for group_name, indices in group_indices.items()
+    }
+    total = len(recordings)
+    target_fractions = (0.70, 0.15, 0.15)
+    best_assignment: tuple[int, ...] | None = None
+    best_score = math.inf
+
+    def assignment_candidates():
+        if len(group_names) <= 9:
+            return itertools.product(range(3), repeat=len(group_names))
+        randomizer = random.Random(seed)
+        return (
+            tuple(randomizer.randrange(3) for _ in group_names)
+            for _ in range(20_000)
+        )
+
+    for assignment in assignment_candidates():
+        if set(assignment) != {0, 1, 2}:
+            continue
+        split_counts = [{label: 0 for label in LABELS} for _ in range(3)]
+        for group_name, split_index in zip(group_names, assignment):
+            for label in LABELS:
+                split_counts[split_index][label] += counts_by_group[group_name][label]
+        if any(split_counts[0][label] == 0 for label in LABELS):
+            continue
+        if any(
+            split_counts[split_index][label] == 0
+            for label in labels_requiring_all_splits
+            for split_index in (1, 2)
+        ):
+            continue
+
+        split_sizes = [sum(counts.values()) for counts in split_counts]
+        size_error = sum(
+            abs(size / total - target)
+            for size, target in zip(split_sizes, target_fractions)
+        )
+        class_error = 0.0
+        for label in LABELS:
+            label_total = sum(counts[label] for counts in split_counts)
+            if not label_total:
+                continue
+            observed = [counts[label] / label_total for counts in split_counts]
+            class_error += sum(
+                abs(actual - target)
+                for actual, target in zip(observed, target_fractions)
+            )
+        score = size_error + class_error * 0.15
+        if score < best_score:
+            best_score = score
+            best_assignment = tuple(assignment)
+
+    if best_assignment is None:
+        raise ValueError(
+            "Could not create non-overlapping splits while keeping every class in training "
+            "and all classes with at least three capture groups represented in validation and test."
+        )
+
+    split_indices = [[], [], []]
+    split_group_names = [[], [], []]
+    for group_name, split_index in zip(group_names, best_assignment):
+        split_group_names[split_index].append(group_name)
+        split_indices[split_index].extend(group_indices[group_name])
+    splits = [
+        [recordings[index] for index in indices]
+        for indices in split_indices
+    ]
+    return (
+        splits[0],
+        splits[1],
+        splits[2],
+        {
+            "train": sorted(split_group_names[0]),
+            "validation": sorted(split_group_names[1]),
+            "test": sorted(split_group_names[2]),
+        },
+    )
 
 
 def stratified_split(

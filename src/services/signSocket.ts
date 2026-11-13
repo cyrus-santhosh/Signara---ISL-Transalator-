@@ -24,7 +24,12 @@ export type RecognitionResponse = {
   timestamp: number;
   frameNumber: number;
   gloss: string | null;
-  label: "hello_how_are_you" | "i_need_help" | "no_sign" | null;
+  label:
+    | "hello_how_are_you"
+    | "i_need_help"
+    | "i_need_to_meet_the_doctor"
+    | "no_sign"
+    | null;
   confidence: number | null;
   probabilities: Record<string, number> | null;
   status:
@@ -148,7 +153,8 @@ export class SignSocket {
           (message.label === null ||
             message.label === "hello_how_are_you" ||
             message.label === "i_need_help" ||
-            message.label === "no_sign") &&
+          message.label === "i_need_to_meet_the_doctor" ||
+          message.label === "no_sign") &&
           "confidence" in message &&
           (message.confidence === null || typeof message.confidence === "number") &&
           "probabilities" in message &&

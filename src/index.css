@@ -2055,6 +2055,24 @@ footer {
 .message-bubble .message-progress {
   color: var(--blue);
 }
+.translation-result {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.3);
+}
+.translation-result > strong {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+.translation-result > p {
+  margin-top: 5px;
+  font-size: 13px;
+}
+.translation-result .audio-player {
+  color: var(--blue);
+  text-align: left;
+}
 .message-error {
   display: flex;
   align-items: flex-start;

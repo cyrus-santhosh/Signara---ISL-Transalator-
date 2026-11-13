@@ -27,6 +27,7 @@ SMOOTHING_VOTES = 2
 LABEL_TO_PHRASE = {
     "hello_how_are_you": "Hello, how are you?",
     "i_need_help": "I need help",
+    "i_need_to_meet_the_doctor": "I need to meet the doctor",
     "no_sign": None,
 }
 
@@ -75,8 +76,17 @@ class RecognitionModel:
             with MODEL_PATH.open("rb") as checkpoint_file:
                 bundle = joblib.load(checkpoint_file)
 
-            if not isinstance(class_to_idx, dict) or set(class_to_idx) != set(LABELS):
-                raise ValueError("Saved class mapping does not match the three supported labels.")
+            if (
+                not isinstance(class_to_idx, dict)
+                or not class_to_idx
+                or any(label not in LABELS for label in class_to_idx)
+                or any(
+                    isinstance(index, bool) or not isinstance(index, int)
+                    for index in class_to_idx.values()
+                )
+                or set(class_to_idx.values()) != set(range(len(class_to_idx)))
+            ):
+                raise ValueError("Saved class mapping has unsupported labels or invalid class IDs.")
             if (
                 not isinstance(preprocessing, dict)
                 or preprocessing.get("feature_size") != TEMPORAL_SEGMENTS * 2 * INPUT_SIZE
@@ -94,6 +104,11 @@ class RecognitionModel:
                 raise ValueError("Checkpoint and saved class mappings do not match.")
             if bundle.get("preprocessing") != preprocessing:
                 raise ValueError("Checkpoint and saved preprocessing configuration do not match.")
+            classifier_classes = set(
+                str(label) for label in bundle["model"].named_steps["classifier"].classes_
+            )
+            if classifier_classes != set(class_to_idx):
+                raise ValueError("Checkpoint output classes do not match the saved class mapping.")
 
             means = preprocessing.get("landmark_means")
             stds = preprocessing.get("landmark_stds")
@@ -139,7 +154,9 @@ class RecognitionModel:
             str(label): float(probability)
             for label, probability in zip(classifier_classes, raw_probabilities)
         }
-        if model_prediction not in self.class_to_idx or set(probabilities) != set(LABELS):
+        if model_prediction not in self.class_to_idx or set(probabilities) != set(
+            self.class_to_idx
+        ):
             raise ValueError("Model returned a class outside the saved mapping.")
         return {
             "label": model_prediction,

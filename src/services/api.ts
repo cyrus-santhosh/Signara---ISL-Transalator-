@@ -68,7 +68,11 @@ export const mockConversations: Conversation[] = [
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
-export type DatasetLabel = "hello_how_are_you" | "i_need_help" | "no_sign";
+export type DatasetLabel =
+  | "hello_how_are_you"
+  | "i_need_help"
+  | "i_need_to_meet_the_doctor"
+  | "no_sign";
 export type DatasetCounts = Record<DatasetLabel, number>;
 
 export type RecognitionModelStatus = {
@@ -88,8 +92,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers,
   });
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(body?.detail ?? `Request failed with status ${response.status}.`);
+    const body = (await response.json().catch(() => null)) as {
+      detail?: string | { code?: string; message?: string };
+    } | null;
+    const detail = typeof body?.detail === "string" ? body.detail : body?.detail?.message;
+    throw new Error(detail ?? `Request failed with status ${response.status}.`);
   }
   return (await response.json()) as T;
 }
@@ -100,7 +107,12 @@ export async function saveDatasetRecording(recording: {
   timestamp: number;
   sequence: KeypointFrame[];
 }) {
-  return request<{ filename: string; counts: DatasetCounts }>("/api/dataset/recording", {
+  return request<{
+    saved: true;
+    label: DatasetLabel;
+    filename: string;
+    counts: DatasetCounts;
+  }>("/api/dataset/recording", {
     method: "POST",
     body: JSON.stringify({
       recording_id: recording.recordingId,
@@ -129,49 +141,26 @@ export async function exportDataset() {
   return response.blob();
 }
 
-export async function postChat(glosses: string[], targetLanguage: string) {
-  const languageCodes: Record<string, string> = {
-    Hindi: "hi",
-    Kannada: "kn",
-    Tamil: "ta",
-    English: "en",
-  };
-  return request<{
-    sentence: string;
-    replyText: string;
-    replyOriginal: string;
-    audioUrl: string;
-  }>("/api/chat", {
-    method: "POST",
-    body: JSON.stringify({
-      glosses,
-      target_lang: languageCodes[targetLanguage] ?? targetLanguage,
-    }),
-  });
-}
-
-export type ConversationResult = {
+export type TranslationResult = {
   original_text: string;
   translated_text: string;
-  assistant_reply: string;
   target_language: "en" | "hi" | "kn";
   audio_url: string | null;
   audio_error: string | null;
 };
 
-export async function getConversationStatus() {
-  return request<{ gemini_configured: boolean; model: string }>("/api/conversation/status");
+export async function getTranslationStatus() {
+  return request<{ groq_configured: boolean; model: string }>("/api/conversation/status");
 }
 
-export async function postConversation(input: {
+export async function postTranslation(input: {
   originalText: string;
   targetLanguage: "en" | "hi" | "kn";
   eventId: string;
-  context: Array<{ role: "user" | "assistant"; text: string }>;
   generateAudio: boolean;
   recognitionLabel?: string;
 }) {
-  const result = await request<Omit<ConversationResult, "audio_url"> & { audio_url: string | null }>(
+  const result = await request<Omit<TranslationResult, "audio_url"> & { audio_url: string | null }>(
     "/api/conversation",
     {
       method: "POST",
@@ -179,7 +168,6 @@ export async function postConversation(input: {
         original_text: input.originalText,
         target_language: input.targetLanguage,
         event_id: input.eventId,
-        context: input.context,
         generate_audio: input.generateAudio,
         recognition_label: input.recognitionLabel,
       }),

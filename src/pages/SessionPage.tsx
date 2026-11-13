@@ -25,10 +25,10 @@ import { AppSidebar } from "../components/AppSidebar";
 import { AppTopbar } from "../components/AppTopbar";
 import {
   exportDataset,
-  getConversationStatus,
   getDatasetCounts,
   getRecognitionModelStatus,
-  postConversation,
+  getTranslationStatus,
+  postTranslation,
   requestSpeech,
   saveDatasetRecording,
   type DatasetCounts,
@@ -50,10 +50,10 @@ type LandmarkCounts = { leftHand: number; rightHand: number; pose: number };
 type RecordingStatus = "idle" | "recording" | "saving" | "saved" | "error";
 const RECORDING_DURATION_MS = 4_000;
 const MIN_RECORDING_DURATION_MS = 3_000;
-const RECOGNITION_COOLDOWN_MS = 5_000;
 const EMPTY_DATASET_COUNTS: DatasetCounts = {
   hello_how_are_you: 0,
   i_need_help: 0,
+  i_need_to_meet_the_doctor: 0,
   no_sign: 0,
 };
 
@@ -124,7 +124,6 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
 
 type SessionMessage = {
   id: number;
-  role: "user" | "assistant";
   text: string;
   sub?: string;
   time: string;
@@ -149,10 +148,8 @@ export function SessionPage() {
   const pausedRef = useRef(false);
   const landmarkPresenceRef = useRef({ leftHand: false, rightHand: false, pose: false });
   const lastAutoSubmittedPhraseRef = useRef<string | null>(null);
-  const recentPhraseSentAtRef = useRef(new Map<string, number>());
   const submitRecognizedRef = useRef<(phrase: string, label: DatasetLabel) => void>(() => {});
   const pendingEventsRef = useRef(new Set<string>());
-  const messagesRef = useRef<SessionMessage[]>([]);
   const languageRef = useRef<"en" | "hi" | "kn">("en");
   const voiceRef = useRef(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -165,9 +162,9 @@ export function SessionPage() {
   const recordingTimestampRef = useRef(0);
   const recordingStartedAtRef = useRef(0);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const recordingCountdownIntervalRef = useRef<
-    ReturnType<typeof setInterval> | undefined
-  >(undefined);
+  const recordingCountdownIntervalRef = useRef<ReturnType<typeof setInterval> | undefined>(
+    undefined,
+  );
   const stopRecordingRef = useRef<() => void>(() => {});
   const [cameraOn, setCameraOn] = useState(false);
   const [cameraStatus, setCameraStatus] = useState("off");
@@ -180,7 +177,7 @@ export function SessionPage() {
   const [recognizedPhrase, setRecognizedPhrase] = useState<string | null>(null);
   const [recognitionModelStatus, setRecognitionModelStatus] =
     useState<RecognitionModelStatus | null>(null);
-  const [geminiConfigured, setGeminiConfigured] = useState<
+  const [groqConfigured, setGroqConfigured] = useState<
     "checking" | "ready" | "missing" | "unavailable"
   >("checking");
   const [landmarkPresence, setLandmarkPresence] = useState({
@@ -210,12 +207,12 @@ export function SessionPage() {
   const [recordingCountdown, setRecordingCountdown] = useState(0);
   const [recordingFrameCount, setRecordingFrameCount] = useState(0);
   const [recordingError, setRecordingError] = useState("");
+  const [recordingSavedFilename, setRecordingSavedFilename] = useState("");
   const [datasetExporting, setDatasetExporting] = useState(false);
   const [datasetExportError, setDatasetExportError] = useState("");
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
-    messagesRef.current = messages;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
@@ -246,15 +243,17 @@ export function SessionPage() {
         timestamp: recordingTimestampRef.current,
         sequence,
       });
+      if (!result.saved || result.label !== recordingLabelRef.current || !result.filename) {
+        throw new Error("The backend did not confirm saving this recording.");
+      }
       setDatasetCounts(result.counts);
       setRecordingFrameCount(sequence.length);
+      setRecordingSavedFilename(result.filename);
       recordingFramesRef.current = [];
       setRecordingStatus("saved");
     } catch (error) {
       setRecordingStatus("error");
-      setRecordingError(
-        error instanceof Error ? error.message : "Could not save this recording.",
-      );
+      setRecordingError(error instanceof Error ? error.message : "Could not save this recording.");
     } finally {
       recordingBusyRef.current = false;
     }
@@ -293,6 +292,7 @@ export function SessionPage() {
     recordingStartedAtRef.current = performance.now();
     recordingActiveRef.current = true;
     setRecordingFrameCount(0);
+    setRecordingSavedFilename("");
     setRecordingError("");
     setRecordingStatus("recording");
     setRecordingCountdown(RECORDING_DURATION_MS / 1000);
@@ -347,7 +347,8 @@ export function SessionPage() {
       recordingFramesRef.current = [];
       recordingBusyRef.current = false;
       if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
-      if (recordingCountdownIntervalRef.current) clearInterval(recordingCountdownIntervalRef.current);
+      if (recordingCountdownIntervalRef.current)
+        clearInterval(recordingCountdownIntervalRef.current);
     };
   }, []);
 
@@ -370,12 +371,12 @@ export function SessionPage() {
           });
         }
       });
-    void getConversationStatus()
+    void getTranslationStatus()
       .then((status) => {
-        if (active) setGeminiConfigured(status.gemini_configured ? "ready" : "missing");
+        if (active) setGroqConfigured(status.groq_configured ? "ready" : "missing");
       })
       .catch(() => {
-        if (active) setGeminiConfigured("unavailable");
+        if (active) setGroqConfigured("unavailable");
       });
     return () => {
       active = false;
@@ -444,17 +445,15 @@ export function SessionPage() {
           result.label !== "no_sign" &&
           result.label !== null
         ) {
-          const phrase =
-            result.label === "hello_how_are_you" ? "Hello, how are you?" : "I need help";
+          const phraseByLabel: Record<Exclude<DatasetLabel, "no_sign">, string> = {
+            hello_how_are_you: "Hello, how are you?",
+            i_need_help: "I need help",
+            i_need_to_meet_the_doctor: "I need to meet the doctor",
+          };
+          const phrase = phraseByLabel[result.label];
           setRecognizedPhrase(phrase);
-          const now = Date.now();
-          const lastSentAt = recentPhraseSentAtRef.current.get(phrase) ?? 0;
-          if (
-            lastAutoSubmittedPhraseRef.current !== phrase &&
-            now - lastSentAt >= RECOGNITION_COOLDOWN_MS
-          ) {
+          if (lastAutoSubmittedPhraseRef.current !== phrase) {
             lastAutoSubmittedPhraseRef.current = phrase;
-            recentPhraseSentAtRef.current.set(phrase, now);
             submitRecognizedRef.current(phrase, result.label);
           }
         }
@@ -700,7 +699,9 @@ export function SessionPage() {
       setCameraOn(false);
       setCameraStatus("error");
       if (error instanceof DOMException && error.name === "NotAllowedError") {
-        setCameraError("Camera permission was denied. Allow camera access in your browser settings.");
+        setCameraError(
+          "Camera permission was denied. Allow camera access in your browser settings.",
+        );
       } else if (error instanceof DOMException && error.name === "NotFoundError") {
         setCameraError("No camera was found on this device.");
       } else if (error instanceof DOMException && error.name === "NotReadableError") {
@@ -715,18 +716,13 @@ export function SessionPage() {
   function addGloss(word: string) {
     setGlosses((old) => [...old.slice(-4), word]);
   }
-  async function requestReply(userMessage: SessionMessage, targetLanguage: "en" | "hi" | "kn") {
+  async function requestTranslation(
+    userMessage: SessionMessage,
+    targetLanguage: "en" | "hi" | "kn",
+  ) {
     if (!userMessage.eventId || pendingEventsRef.current.has(userMessage.eventId)) return;
     pendingEventsRef.current.add(userMessage.eventId);
     setSending(true);
-    const context = messagesRef.current
-      .filter((message) => message.id !== userMessage.id && !message.pending)
-      .slice(-8)
-      .map((message) => ({
-        role: message.role,
-        text: message.role === "user" ? message.translated ?? message.text : message.text,
-      }));
-    const assistantMessageId = Date.now() + Math.random();
     setMessages((old) =>
       old.map((message) =>
         message.id === userMessage.id
@@ -735,16 +731,15 @@ export function SessionPage() {
       ),
     );
     try {
-      const result = await postConversation({
+      const result = await postTranslation({
         originalText: userMessage.text,
         targetLanguage,
         eventId: userMessage.eventId,
-        context,
-        generateAudio: voiceRef.current,
+        generateAudio: false,
         recognitionLabel: userMessage.recognitionLabel,
       });
-      setMessages((old) => {
-        const updated = old.map((message) =>
+      setMessages((old) =>
+        old.map((message) =>
           message.id === userMessage.id
             ? {
                 ...message,
@@ -752,32 +747,39 @@ export function SessionPage() {
                 pending: false,
                 error: undefined,
                 targetLanguage: result.target_language,
+                audioUrl: result.audio_url ?? undefined,
+                audioError: result.audio_error,
               }
             : message,
-        );
-        if (updated.some((message) => message.role === "assistant" && message.eventId === userMessage.eventId)) {
-          return updated;
+        ),
+      );
+      if (voiceRef.current) {
+        setAudioLoadingId(userMessage.id);
+        try {
+          const audioUrl = await requestSpeech(result.translated_text, result.target_language);
+          setMessages((old) =>
+            old.map((message) =>
+              message.id === userMessage.id ? { ...message, audioUrl, audioError: null } : message,
+            ),
+          );
+          if (voiceRef.current) {
+            const audio = new Audio(audioUrl);
+            audioRef.current = audio;
+            audio.onended = () => setPlaying(0);
+            setPlaying(userMessage.id);
+            void audio.play().catch(() => setPlaying(0));
+          }
+        } catch (error) {
+          const audioError =
+            error instanceof Error ? error.message : "Speech could not be generated.";
+          setMessages((old) =>
+            old.map((message) =>
+              message.id === userMessage.id ? { ...message, audioError } : message,
+            ),
+          );
+        } finally {
+          setAudioLoadingId(0);
         }
-        return [
-          ...updated,
-          {
-            id: assistantMessageId,
-            role: "assistant",
-            text: result.assistant_reply,
-            time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-            audioUrl: result.audio_url ?? undefined,
-            audioError: result.audio_error,
-            eventId: userMessage.eventId,
-            targetLanguage: result.target_language,
-          },
-        ];
-      });
-      if (voiceRef.current && result.audio_url) {
-        const audio = new Audio(result.audio_url);
-        audioRef.current = audio;
-        audio.onended = () => setPlaying(0);
-        setPlaying(assistantMessageId);
-        void audio.play().catch(() => setPlaying(0));
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "The message could not be sent.";
@@ -797,7 +799,6 @@ export function SessionPage() {
     const eventId = crypto.randomUUID();
     const message: SessionMessage = {
       id: Date.now(),
-      role: "user",
       text: originalText.trim(),
       time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       eventId,
@@ -806,7 +807,7 @@ export function SessionPage() {
       recognitionLabel,
     };
     setMessages((old) => [...old, message]);
-    void requestReply(message, languageRef.current);
+    void requestTranslation(message, languageRef.current);
   }
 
   submitRecognizedRef.current = (phrase, label) => {
@@ -822,7 +823,7 @@ export function SessionPage() {
   }
 
   async function playMessage(message: SessionMessage) {
-    if (message.pending || message.role !== "assistant") return;
+    if (message.pending || !message.translated) return;
     if (playing === message.id) {
       audioRef.current?.pause();
       setPlaying(0);
@@ -833,7 +834,7 @@ export function SessionPage() {
       const languageCode = message.targetLanguage ?? languageRef.current;
       setAudioLoadingId(message.id);
       try {
-        audioUrl = await requestSpeech(message.text, languageCode);
+        audioUrl = await requestSpeech(message.translated, languageCode);
         setMessages((old) =>
           old.map((item) =>
             item.id === message.id ? { ...item, audioUrl, audioError: null } : item,
@@ -862,7 +863,7 @@ export function SessionPage() {
     <div className="app-frame">
       <AppSidebar />
       <main className="app-main session-main">
-        <AppTopbar title="Live conversation" subtitle="Your signs are translated in real time" />
+        <AppTopbar title="Live translation" subtitle="Your signs are translated in real time" />
         <div className="session-controls mobile-controls">
           <button
             className={voiceOn ? "control active" : "control"}
@@ -891,11 +892,7 @@ export function SessionPage() {
               {cameraOn ? (
                 <>
                   <video ref={videoRef} autoPlay playsInline muted />
-                  <canvas
-                    ref={landmarkCanvasRef}
-                    className="landmark-overlay"
-                    aria-hidden="true"
-                  />
+                  <canvas ref={landmarkCanvasRef} className="landmark-overlay" aria-hidden="true" />
                 </>
               ) : (
                 <div className="camera-placeholder">
@@ -903,7 +900,10 @@ export function SessionPage() {
                     <Hand />
                   </div>
                   <h2>Camera is off</h2>
-                  <p>{cameraError || "Turn it on to extract landmarks and recognize supported phrases."}</p>
+                  <p>
+                    {cameraError ||
+                      "Turn it on to extract landmarks and recognize supported phrases."}
+                  </p>
                   <button className="btn btn-light" onClick={toggleCamera}>
                     <Camera size={18} />
                     {cameraStatus === "requesting" ? "Requesting camera…" : "Turn on camera"}
@@ -928,9 +928,9 @@ export function SessionPage() {
                   </strong>
                 </div>
                 <small>
-                  Landmarks: left hand {landmarkPresence.leftHand ? "detected" : "missing"} ·
-                  right hand {landmarkPresence.rightHand ? "detected" : "missing"} ·
-                  pose {landmarkPresence.pose ? "detected" : "missing"}
+                  Landmarks: left hand {landmarkPresence.leftHand ? "detected" : "missing"} · right
+                  hand {landmarkPresence.rightHand ? "detected" : "missing"} · pose{" "}
+                  {landmarkPresence.pose ? "detected" : "missing"}
                 </small>
                 <small>
                   Video processing: {videoProcessingStatus} · {videoRef.current?.videoWidth ?? 0}×
@@ -1030,7 +1030,9 @@ export function SessionPage() {
               <div className="dataset-recorder-heading">
                 <div>
                   <strong id="dataset-recorder-title">Phrase dataset recording</strong>
-                  <small>Captures real landmarks from this camera session; no predictions are made.</small>
+                  <small>
+                    Captures real landmarks from this camera session; no predictions are made.
+                  </small>
                 </div>
                 <button
                   type="button"
@@ -1064,6 +1066,9 @@ export function SessionPage() {
                 >
                   <option value="hello_how_are_you">Hello, how are you?</option>
                   <option value="i_need_help">I need help</option>
+                  <option value="i_need_to_meet_the_doctor">
+                    I need to meet the doctor
+                  </option>
                   <option value="no_sign">Neutral / no sign</option>
                 </select>
               </label>
@@ -1104,9 +1109,19 @@ export function SessionPage() {
                 </span>
               </div>
               <div className="dataset-counts" aria-live="polite">
-                <span>Hello, how are you? <strong>{datasetCounts.hello_how_are_you}</strong></span>
-                <span>I need help <strong>{datasetCounts.i_need_help}</strong></span>
-                <span>Neutral / no sign <strong>{datasetCounts.no_sign}</strong></span>
+                <span>
+                  Hello, how are you? <strong>{datasetCounts.hello_how_are_you}</strong>
+                </span>
+                <span>
+                  I need help <strong>{datasetCounts.i_need_help}</strong>
+                </span>
+                <span>
+                  I need to meet the doctor{" "}
+                  <strong>{datasetCounts.i_need_to_meet_the_doctor}</strong>
+                </span>
+                <span>
+                  Neutral / no sign <strong>{datasetCounts.no_sign}</strong>
+                </span>
               </div>
               <small className="dataset-record-status" aria-live="polite">
                 {recordingStatus === "recording"
@@ -1114,7 +1129,7 @@ export function SessionPage() {
                   : recordingStatus === "saving"
                     ? "Saving this landmark sequence to the backend dataset."
                     : recordingStatus === "saved"
-                      ? "Recording saved successfully."
+                    ? `Recording saved successfully (${recordingSavedFilename}).`
                       : cameraOn && videoProcessingStatus === "running"
                         ? "Ready. Each sample records for 4 seconds; stop is enabled after 3 seconds."
                         : "Turn on the camera and wait for video processing before recording."}
@@ -1139,7 +1154,7 @@ export function SessionPage() {
                     <Plus />
                   </span>
                   <div>
-                    <strong>Manual input</strong>
+                    <strong>Manual translation</strong>
                     <small>Camera unavailable? Keep the conversation going.</small>
                   </div>
                 </div>
@@ -1159,9 +1174,13 @@ export function SessionPage() {
                   value={text}
                   onChange={(e) => setText(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                  placeholder="Type a message or add glosses above…"
+                  placeholder="Type English text or add glosses to translate…"
                 />
-                <button onClick={() => void sendMessage()} aria-label="Send message" disabled={sending}>
+                <button
+                  onClick={() => void sendMessage()}
+                  aria-label="Send message"
+                  disabled={sending}
+                >
                   <Send size={18} />
                 </button>
               </div>
@@ -1172,17 +1191,16 @@ export function SessionPage() {
               <div>
                 <span className="online-dot" />
                 <div>
-                  <h2>Conversation</h2>
+                  <h2>Translation</h2>
                   <p>
-                    {geminiConfigured === "missing"
-                      ? "Gemini is not configured"
-                      : geminiConfigured === "checking"
+                    {groqConfigured === "missing"
+                      ? "Groq is not configured"
+                      : groqConfigured === "checking"
                         ? "Checking conversation service…"
-                        : geminiConfigured === "unavailable"
+                        : groqConfigured === "unavailable"
                           ? "Conversation service unavailable"
-                          : "Gemini ready"}{" "}
-                    ·{" "}
-                    {language === "en" ? "English" : language === "hi" ? "हिन्दी" : "ಕನ್ನಡ"}
+                          : "Groq ready"}{" "}
+                    · {language === "en" ? "English" : language === "hi" ? "हिन्दी" : "ಕನ್ನಡ"}
                   </p>
                 </div>
               </div>
@@ -1208,31 +1226,76 @@ export function SessionPage() {
             </div>
             <div className="messages" aria-live="polite">
               {messages.length === 0 && (
-                <p className="conversation-empty">Recognized signs and replies will appear here.</p>
+                <p className="conversation-empty">
+                  Recognized signs and their translations will appear here.
+                </p>
               )}
               {messages.map((message) => (
                 <motion.div
                   layout
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className={`message ${message.role}`}
+                  className="message user"
                   key={message.id}
                 >
                   <div className="message-meta">
-                    <span>{message.role === "user" ? "You signed" : "Signara"}</span>
+                    <span>YOU SIGNED</span>
                     <small>{message.time}</small>
                   </div>
                   <div className="message-bubble">
                     <p>{message.text}</p>
-                    {message.translated && <small>Translation: {message.translated}</small>}
-                    {message.pending && (
-                      <small className="message-progress">Signara is preparing a reply…</small>
+                    {message.pending && <small className="message-progress">Translating…</small>}
+                    {message.translated && (
+                      <div className="translation-result">
+                        <strong>TRANSLATION</strong>
+                        <p>{message.translated}</p>
+                        <button
+                          className="audio-player"
+                          onClick={() => void playMessage(message)}
+                          disabled={audioLoadingId === message.id}
+                          aria-label={
+                            audioLoadingId === message.id
+                              ? "Generating translation speech"
+                              : playing === message.id
+                                ? "Pause translation audio"
+                                : "Play translation audio"
+                          }
+                        >
+                          {audioLoadingId === message.id ? (
+                            <span className="audio-loading" />
+                          ) : playing === message.id ? (
+                            <Pause size={15} />
+                          ) : (
+                            <Play size={15} />
+                          )}
+                          <span className={playing === message.id ? "wave playing" : "wave"}>
+                            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((i) => (
+                              <i key={i} />
+                            ))}
+                          </span>
+                          <small>
+                            {audioLoadingId === message.id
+                              ? "Loading"
+                              : playing === message.id
+                                ? "Pause"
+                                : "Play"}
+                          </small>
+                        </button>
+                        {message.audioError && (
+                          <small className="audio-error">{message.audioError}</small>
+                        )}
+                      </div>
                     )}
                     {message.error && (
                       <div className="message-error">
                         <small>{message.error}</small>
                         <button
-                          onClick={() => void requestReply(message, languageRef.current)}
+                          onClick={() =>
+                            void requestTranslation(
+                              message,
+                              message.targetLanguage ?? languageRef.current,
+                            )
+                          }
                           disabled={message.pending}
                         >
                           Retry
@@ -1240,31 +1303,6 @@ export function SessionPage() {
                       </div>
                     )}
                   </div>
-                  {message.role === "assistant" && (
-                    <button
-                      className="audio-player"
-                      onClick={() => playMessage(message)}
-                      disabled={message.pending || audioLoadingId === message.id}
-                      aria-label={audioLoadingId === message.id ? "Generating speech" : "Play reply"}
-                    >
-                      {audioLoadingId === message.id ? (
-                        <span className="audio-loading" />
-                      ) : playing === message.id ? (
-                        <Pause size={15} />
-                      ) : (
-                        <Play size={15} />
-                      )}
-                      <span className={playing === message.id ? "wave playing" : "wave"}>
-                        {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((i) => (
-                          <i key={i} />
-                        ))}
-                      </span>
-                      <small>{audioLoadingId === message.id ? "Loading" : "Play"}</small>
-                    </button>
-                  )}
-                  {message.role === "assistant" && message.audioError && (
-                    <small className="audio-error">{message.audioError}</small>
-                  )}
                 </motion.div>
               ))}
               <div ref={messagesEndRef} />
@@ -1275,8 +1313,8 @@ export function SessionPage() {
                 <strong>Voice output is {voiceOn ? "on" : "off"}</strong>
                 <small>
                   {voiceOn
-                    ? `Replies play automatically in ${language === "en" ? "English" : language === "hi" ? "Hindi" : "Kannada"}`
-                    : "Turn on to hear replies"}
+                    ? `Translations play automatically in ${language === "en" ? "English" : language === "hi" ? "Hindi" : "Kannada"}`
+                    : "Translations can be played manually"}
                 </small>
               </div>
               <button

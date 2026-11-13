@@ -2,7 +2,7 @@
 
 ## Run locally
 
-From the project root, copy `.env.example` to `.env`, add a Gemini API key, and set
+From the project root, copy `.env.example` to `.env`, add a Groq API key, and set
 `AUTH_SECRET_KEY` to a random value of at least 32 characters. Then run:
 
 ```powershell
@@ -19,11 +19,16 @@ to the backend in the production web server.
 
 - `GET /api/health` — liveness check.
 - `GET /api/recognition/model-status` — reports the loaded model path, type, and load error.
+- `GET /api/conversation/status` — reports Groq configuration status and the configured model.
+- `POST /api/conversation` — translation-only endpoint. Accepts a recognized English phrase,
+  language code (`en`, `hi`, or `kn`), and event ID; returns the original phrase and translation.
+  Speech is generated separately from the translated text when requested.
+- `POST /api/speech` — generate or replay speech for translated text.
 - `GET /api/dataset/counts` — sample counts for each phrase and the optional neutral class.
 - `POST /api/dataset/recording` — validate and save a captured landmark sequence.
 - `GET /api/dataset/export.zip` — download the collected dataset as a ZIP archive.
-- `POST /api/chat` — accepts `{"glosses":["HELLO"],"target_lang":"hi"}` and returns
-  the interpreted sentence, translated reply, and an `/api/audio/...` URL.
+- `POST /api/chat` — legacy-compatible translation-only route accepting
+  `{"glosses":["HELLO"],"target_lang":"hi"}`.
 - `POST /api/auth/register` and `POST /api/auth/login` — create an account or
   authenticate with email and password.
 - `GET /api/audio/{filename}` — serve generated MP3 speech.
@@ -63,10 +68,15 @@ isolated, pre-segmented signs, but does not by itself solve continuous sequence
 decoding.
 
 The SQLite database and generated audio are stored under `backend/data/` by default.
-Persist that directory when running the Docker image. Gemini and gTTS calls need
-outbound network access; chat returns a clear service error if Gemini is not configured.
+Persist that directory when running the Docker image. Configure `GROQ_API_KEY`,
+`GROQ_MODEL` (defaults to `openai/gpt-oss-20b`), and optionally
+`GROQ_TIMEOUT_SECONDS` in the root `.env`. Groq and gTTS calls need outbound network
+access; translation requests return a clear service error if Groq is not configured.
 Dataset recordings are stored under `backend/dataset/<label>/` as individual JSON
-files. Allowed labels are `hello_how_are_you`, `i_need_help`, and `no_sign`.
+files. Allowed labels are `hello_how_are_you`, `i_need_help`,
+`i_need_to_meet_the_doctor`, and `no_sign`. The new doctor phrase can be recorded
+there; the checked-in recognition model remains unchanged until it is explicitly
+retrained to include that class.
 Each sample includes its label, recording timestamp, frame count, and ordered
 validated keypoint frames. The session recorder captures approximately four
 seconds at the existing MediaPipe processing rate and does not create a second
